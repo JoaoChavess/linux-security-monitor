@@ -67,7 +67,7 @@ sudo python3 linux_security_monitor.py --once --json
 
 ## Possíveis melhorias futuras
 
-- Enviar alerta automático por e-mail/webhook quando detectar força bruta
+- Enviar alerta automático por e-mail/webhook quando detectar força bruta (Feito)
 - Persistir histórico em banco de dados (SQLite) para análise de tendência
 - Adicionar verificação de integridade de arquivos críticos (`/etc/passwd`, `/etc/shadow`)
 - Integração com um SIEM (ex: enviar eventos para o Wazuh ou Splunk)
