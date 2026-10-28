@@ -8,15 +8,8 @@ sinais que um Analista SOC observaria em um ambiente real:
   1. Tentativas de login SSH falhas (possível força bruta)
   2. Criação de novos usuários no sistema
   3. Uso do comando sudo (elevação de privilégio)
-  4. Portas de rede em escuta (superfície de ataque exposta)
-
-O script lê os logs padrão do sistema (/var/log/auth.log ou
-/var/log/secure, dependendo da distro) e gera um relatório em texto
-e em JSON, além de imprimir alertas no terminal em tempo real.
-
-Uso:
-    sudo python3 linux_security_monitor.py --once
-    sudo python3 linux_security_monitor.py --watch --interval 30
+  4. Portas de rede em escuta e identificação de processos anômalos
+  5. Alertas automáticos via Webhook (Discord/Slack)
 
 Autor: João Victor Chaves
 """
@@ -28,12 +21,45 @@ import re
 import subprocess
 import sys
 import time
+import urllib.request
+import urllib.error
 from collections import Counter
 from datetime import datetime
 
 AUTH_LOG_PATHS = ["/var/log/auth.log", "/var/log/secure"]
-
 FAILED_LOGIN_THRESHOLD = 5  # alerta se o mesmo IP falhar N vezes ou mais
+
+SUSPICIOUS_PROCESS_NAMES = {
+    "nc", "ncat", "netcat", "socat", "python", "python3",
+    "perl", "ruby", "php", "bash", "sh", "zsh"
+}
+KNOWN_STANDARD_PORTS = {22, 53, 80, 443}
+
+
+def send_webhook_alert(webhook_url, message, severity="CRITICAL"):
+    """Envia notificação via Webhook usando apenas a biblioteca padrão urllib."""
+    if not webhook_url:
+        return
+
+    formatted_message = f"**[{severity}] Alerta de Segurança - Linux Monitor**\n```\n{message}\n```"
+    payload = {"content": formatted_message}
+    data = json.dumps(payload).encode('utf-8')
+    
+    req = urllib.request.Request(
+        webhook_url, 
+        data=data, 
+        headers={
+            'Content-Type': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' # Disfarce para não ser bloqueado
+        },
+        method='POST'
+    )
+
+    try:
+        urllib.request.urlopen(req, timeout=5)
+    except Exception as e:
+        # Silencioso em caso de falha de rede contínua para não sujar o log da tela
+        pass
 
 
 def find_auth_log():
@@ -45,7 +71,7 @@ def find_auth_log():
 
 
 def read_log_lines(path, max_lines=5000):
-    """Lê as últimas N linhas do log (evita carregar arquivos gigantes)."""
+    """Lê as últimas N linhas do log."""
     try:
         with open(path, "r", errors="ignore") as f:
             lines = f.readlines()
@@ -58,11 +84,7 @@ def read_log_lines(path, max_lines=5000):
 
 
 def check_failed_logins(lines):
-    """
-    Procura por linhas de falha de autenticação SSH e conta quantas
-    vezes cada IP apareceu. Retorna os IPs que passaram do limite
-    (possível indicação de força bruta / password spraying).
-    """
+    """Procura por linhas de falha de autenticação SSH."""
     pattern = re.compile(r"Failed password for(?: invalid user)? \S+ from (\d{1,3}(?:\.\d{1,3}){3})")
     ip_counter = Counter()
 
@@ -97,27 +119,75 @@ def check_sudo_usage(lines):
     return found
 
 
-def check_listening_ports():
-    """
-    Lista as portas de rede atualmente em escuta usando 'ss' (ou 'netstat'
-    como alternativa). Portas abertas desnecessárias são uma superfície
-    de ataque que um analista deve sempre revisar.
-    """
-    try:
-        result = subprocess.run(
-            ["ss", "-tulnp"], capture_output=True, text=True, timeout=5
-        )
-        return result.stdout.strip().splitlines()
-    except FileNotFoundError:
+def parse_address_and_port(addr_str):
+    """Trata múltiplos formatos de IP e porta retornados pelo ss."""
+    addr_str = addr_str.strip()
+    match_ipv6 = re.match(r"^\[(?P<ip>.*)\]:(?P<port>\d+)$", addr_str)
+    if match_ipv6:
+        return match_ipv6.group("ip"), int(match_ipv6.group("port"))
+
+    if ":" in addr_str:
+        ip_part, port_part = addr_str.rsplit(":", 1)
+        if ip_part in ("*", ""):
+            ip_part = "0.0.0.0"
         try:
-            result = subprocess.run(
-                ["netstat", "-tulnp"], capture_output=True, text=True, timeout=5
-            )
-            return result.stdout.strip().splitlines()
-        except FileNotFoundError:
-            return ["[!] Nem 'ss' nem 'netstat' disponíveis neste sistema."]
+            return ip_part, int(port_part)
+        except ValueError:
+            return ip_part, None
+
+    return addr_str, None
+
+
+def check_listening_ports_structured():
+    """Executa 'ss -tulnp' e sinaliza processos suspeitos."""
+    try:
+        raw_output = subprocess.run(["ss", "-tulnp"], capture_output=True, text=True, timeout=5, check=True).stdout
     except Exception as e:
-        return [f"[!] Erro ao listar portas: {e}"]
+        return {"error": f"Falha ao executar ss: {e}", "listeners": [], "alerts": []}
+
+    lines = raw_output.strip().splitlines()
+    if not lines:
+        return {"error": "Nenhuma saída", "listeners": [], "alerts": []}
+
+    proc_pattern = re.compile(r'users:\(\("(?P<name>[^"]+)",(?:pid=(?P<pid>\d+))?')
+    listeners, alerts = [], []
+
+    for line in lines[1:]:
+        parts = line.split()
+        if len(parts) < 5: continue
+
+        proto = parts[0].lower()
+        ip, port = parse_address_and_port(parts[4])
+        if port is None: continue
+
+        process_name, pid = "unknown", None
+        users_meta = " ".join(parts[5:]) if len(parts) > 5 else ""
+        proc_match = proc_pattern.search(users_meta)
+
+        if proc_match:
+            process_name = proc_match.group("name")
+            pid = int(proc_match.group("pid")) if proc_match.group("pid") else None
+
+        is_wildcard = ip in ("0.0.0.0", "::", "[::]")
+
+        listener_entry = {
+            "protocol": proto, "bind_ip": ip, "port": port,
+            "is_public_interface": is_wildcard, "process_name": process_name, "pid": pid
+        }
+        listeners.append(listener_entry)
+
+        if process_name.lower() in SUSPICIOUS_PROCESS_NAMES:
+            alerts.append({
+                "severity": "CRITICAL",
+                "message": f"Processo suspeito '{process_name}' (PID: {pid}) escutando em {ip}:{port}"
+            })
+        elif is_wildcard and port not in KNOWN_STANDARD_PORTS:
+            alerts.append({
+                "severity": "MEDIUM",
+                "message": f"Porta não padrão {port} aberta em 0.0.0.0/:: por '{process_name}'"
+            })
+
+    return {"listeners": listeners, "alerts": alerts}
 
 
 def run_scan():
@@ -130,6 +200,7 @@ def run_scan():
         "new_users": [],
         "sudo_usage": [],
         "listening_ports": [],
+        "port_alerts": [],
     }
 
     log_path = find_auth_log()
@@ -145,13 +216,15 @@ def run_scan():
     else:
         print("[!] Nenhum log de autenticação encontrado (auth.log / secure).")
 
-    report["listening_ports"] = check_listening_ports()
+    ports_data = check_listening_ports_structured()
+    report["listening_ports"] = ports_data.get("listeners", [])
+    report["port_alerts"] = ports_data.get("alerts", [])
 
     return report
 
 
 def print_human_report(report):
-    """Imprime o relatório de forma legível no terminal, com alertas destacados."""
+    """Imprime o relatório de forma legível no terminal."""
     print("=" * 60)
     print(f" Linux Security Monitor — {report['timestamp']}")
     print("=" * 60)
@@ -171,25 +244,44 @@ def print_human_report(report):
         for u in report["new_users"]:
             print(f"  + usuário criado: {u['user']}")
     else:
-        print("  Nenhum novo usuário detectado no período analisado.")
+        print("  Nenhum novo usuário detectado.")
 
     print("\n[Uso de sudo (elevação de privilégio)]")
     if report["sudo_usage"]:
-        for entry in report["sudo_usage"][-10:]:  # mostra os 10 mais recentes
+        for entry in report["sudo_usage"][-10:]:
             print(f"  {entry['user']} executou: {entry['command']}")
     else:
-        print("  Nenhum uso de sudo registrado no período analisado.")
+        print("  Nenhum uso de sudo registrado.")
 
-    print("\n[Portas em escuta (superfície de ataque)]")
-    for line in report["listening_ports"]:
-        print(f"  {line}")
+    print("\n[Portas em Escuta e Alertas de Rede]")
+    if report.get("port_alerts"):
+        for alert in report["port_alerts"]:
+            print(f"  [!][{alert['severity']}] {alert['message']}")
+    else:
+        print("  [OK] Nenhum processo suspeito na rede.")
 
     print("\n" + "=" * 60)
-    if report["brute_force_suspects"]:
-        print("[ALERTA] Há IPs com múltiplas falhas de login — investigar possível força bruta.")
+    has_issues = bool(report["brute_force_suspects"] or report.get("port_alerts"))
+    if has_issues:
+        print("[ALERTA GERAL] Anomalias críticas detectadas no host — verificar detalhes acima.")
     else:
-        print("[OK] Nenhum indício de força bruta detectado nesta varredura.")
+        print("[OK GERAL] Nenhum indício crítico detectado nesta varredura.")
     print("=" * 60)
+
+
+def process_webhook_alerts(report, webhook_url):
+    """Lê o relatório e dispara os alertas críticos para o Discord."""
+    if not webhook_url: 
+        return
+
+    if report.get("brute_force_suspects"):
+        ips = ", ".join(report["brute_force_suspects"].keys())
+        msg = f"Possível ataque de força bruta SSH detectado.\nIP(s) ofensores: {ips}"
+        send_webhook_alert(webhook_url, msg, severity="CRITICAL")
+
+    if report.get("port_alerts"):
+        for alert in report["port_alerts"]:
+            send_webhook_alert(webhook_url, alert["message"], severity=alert["severity"])
 
 
 def save_json_report(report, path="security_report.json"):
@@ -199,15 +291,19 @@ def save_json_report(report, path="security_report.json"):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Linux Security Monitor - monitoramento básico de segurança.")
-    parser.add_argument("--once", action="store_true", help="Executa uma única varredura e sai.")
+    parser = argparse.ArgumentParser(description="Linux Security Monitor - monitoramento SOC.")
+    parser.add_argument("--once", action="store_true", help="Executa uma única varredura.")
     parser.add_argument("--watch", action="store_true", help="Executa continuamente em loop.")
-    parser.add_argument("--interval", type=int, default=60, help="Intervalo em segundos entre varreduras (--watch).")
-    parser.add_argument("--json", action="store_true", help="Também salva o relatório em JSON.")
+    parser.add_argument("--interval", type=int, default=60, help="Intervalo em segundos (--watch).")
+    parser.add_argument("--json", action="store_true", help="Salva o relatório em JSON.")
+    parser.add_argument("--webhook", type=str, default=None, help="URL do Webhook do Discord/Slack")
     args = parser.parse_args()
 
     if not args.once and not args.watch:
-        args.once = True  # padrão: roda uma vez se nada for especificado
+        args.once = True
+
+    if args.webhook:
+        send_webhook_alert(args.webhook, "🟢 Linux Security Monitor iniciado.", severity="INFO")
 
     if args.watch:
         print(f"[*] Monitoramento contínuo iniciado (intervalo: {args.interval}s). Ctrl+C para parar.\n")
@@ -215,18 +311,21 @@ def main():
             while True:
                 report = run_scan()
                 print_human_report(report)
+                process_webhook_alerts(report, args.webhook)
+                
                 if args.json:
                     save_json_report(report)
+                
                 time.sleep(args.interval)
         except KeyboardInterrupt:
-            print("\n[*] Monitoramento interrompido pelo usuário.")
+            print("\n[*] Monitoramento interrompido.")
             sys.exit(0)
     else:
         report = run_scan()
         print_human_report(report)
+        process_webhook_alerts(report, args.webhook)
         if args.json:
             save_json_report(report)
-
 
 if __name__ == "__main__":
     main()
